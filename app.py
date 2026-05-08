@@ -13,6 +13,7 @@ import io
 import os
 import re
 import sys
+import time
 import socket
 import platform
 import subprocess
@@ -888,10 +889,15 @@ with tab_fw:
 
 
 # ============================================================
-# TAB 4 — VPN 가디언 (WireGuard)
+# TAB 4 — VPN 가디언 (WireGuard) — Minimalist + Uptime
 # ============================================================
 with tab_vpn:
-    st.header("🌐 VPN 가디언 — WireGuard 관리")
+
+    # ── session state 초기화 ───────────────────────────────
+    if "vpn_running"    not in st.session_state:
+        st.session_state["vpn_running"]    = False
+    if "vpn_start_time" not in st.session_state:
+        st.session_state["vpn_start_time"] = None
 
     # ── 설치 및 권한 확인 ─────────────────────────────────
     status = wg_status()
@@ -918,224 +924,234 @@ with tab_vpn:
             )
         st.stop()
 
-    # Windows 관리자 권한 경고
+    # ── Windows 관리자 권한 배너 (탭 최상단, 눈에 띄게) ───
     if IS_WINDOWS and not status["admin_ok"]:
-        st.error(
-            "🔒 **관리자 권한이 없습니다.**\n\n"
-            "WireGuard 서비스 제어와 방화벽 규칙 적용에는 관리자 권한이 필요합니다.\n\n"
-            "**해결 방법:** CMD 또는 PowerShell 을 "
-            "**'관리자 권한으로 실행'** 한 후 앱을 재시작하십시오."
+        st.markdown(
+            '<div style="background:#ff4b4b;color:white;padding:14px 18px;'
+            'border-radius:8px;font-size:15px;margin-bottom:12px">'
+            '🔒 <b>관리자 권한 없음</b> — WireGuard 서비스 제어가 제한됩니다.<br>'
+            '<small>CMD / PowerShell을 <b>관리자 권한으로 실행</b>한 후 앱을 재시작하십시오.</small>'
+            '</div>',
+            unsafe_allow_html=True,
         )
-        st.warning("읽기 전용 기능(키 생성, 설정 파일 작성)은 계속 사용할 수 있습니다.")
 
-    # ── VPN 상태 카드 ──────────────────────────────────────
-    running    = status["running"]
-    state_icon = "🟢 실행 중" if running else "🔴 중지됨"
-    admin_icon = "✅ 관리자" if status.get("admin_ok", True) else "⚠️ 일반 사용자"
-    wg_path_label = _WG_WIN_EXE if IS_WINDOWS else "wg (PATH)"
+    # ── 업타임 계산 ────────────────────────────────────────
+    def _fmt_uptime(start: datetime) -> str:
+        delta = datetime.now() - start
+        h, rem = divmod(int(delta.total_seconds()), 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    is_running  = st.session_state["vpn_running"]
+    start_time  = st.session_state["vpn_start_time"]
+
+    # ── 미니멀 상태 카드 ───────────────────────────────────
+    if is_running and start_time:
+        uptime_str   = _fmt_uptime(start_time)
+        card_border  = "#22c55e"   # green
+        shield_icon  = "🛡️"
+        status_text  = "현재 외부 위협으로부터 보호 중입니다."
+        uptime_block = (
+            f'<div style="font-size:28px;font-weight:700;'
+            f'letter-spacing:2px;margin:8px 0">{uptime_str}</div>'
+            f'<div style="opacity:.7;font-size:13px">보안 연결 유지 시간</div>'
+        )
+    else:
+        card_border  = "#6b7280"   # gray
+        shield_icon  = "🔓"
+        status_text  = "보안 연결이 비활성화 상태입니다."
+        uptime_block = ""
 
     st.markdown(
-        f'<div class="info-card">'
-        f'<b>상태:</b> {state_icon} &nbsp;|&nbsp; '
-        f'<b>권한:</b> {admin_icon}<br>'
-        f'<small style="opacity:.7">경로: {wg_path_label}</small>'
+        f'<div style="border:2px solid {card_border};border-radius:14px;'
+        f'padding:28px 24px;text-align:center;margin-bottom:16px">'
+        f'<div style="font-size:52px">{shield_icon}</div>'
+        f'<div style="font-size:16px;margin:6px 0">{status_text}</div>'
+        f'{uptime_block}'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    iface = st.text_input("인터페이스 이름:", value="wg0", key="wg_iface")
+    # ── 고급 설정 (기본 접힘) ─────────────────────────────
+    with st.expander("⚙️ 고급 설정", expanded=False):
+        iface    = st.text_input("인터페이스:", value="wg0", key="wg_iface")
+        sv_addr  = st.text_input("서버 VPN 주소:", value="10.0.0.1/24", key="sv_addr")
+        sv_port  = st.number_input("수신 포트:", value=51820,
+                                   min_value=1024, max_value=65535, key="sv_port")
+    # 고급 설정이 접혀 있을 때 기본값 사용
+    iface   = st.session_state.get("wg_iface",  "wg0")
+    sv_addr = st.session_state.get("sv_addr",   "10.0.0.1/24")
+    sv_port = int(st.session_state.get("sv_port", 51820))
 
-    col_up, col_down = st.columns(2)
-    with col_up:
-        if st.button("▶️ VPN 시작", use_container_width=True, type="primary"):
-            with st.spinner(f"wg-quick up {iface} ..."):
+    # ── 원터치 시작 / 중지 ────────────────────────────────
+    col_start, col_stop = st.columns(2)
+
+    with col_start:
+        start_disabled = is_running
+        if st.button("▶ VPN 시작", type="primary",
+                     use_container_width=True, disabled=start_disabled):
+            # 1) conf 없으면 즉석 생성
+            if IS_WINDOWS:
+                conf_path = os.path.join(_WG_WIN_CONF_DIR, f"{iface}.conf")
+            else:
+                conf_path = f"/etc/wireguard/{iface}.conf"
+
+            if not os.path.isfile(conf_path):
+                with st.spinner("설정 파일 없음 — 기본값으로 즉석 생성 중..."):
+                    res = create_server_config(iface, sv_addr, sv_port)
+                if res.get("error"):
+                    st.error(f"설정 생성 실패: {res['error']}")
+                    st.stop()
+                st.session_state["server_pub"]  = res["pub"]
+                st.session_state["server_port"] = sv_port
+
+            # 2) WireGuard 시작
+            with st.spinner(f"WireGuard {iface} 시작 중..."):
                 out = wg_up(iface)
             if out:
                 st.code(out, language="text")
+
+            # 3) 타이머 시작
+            st.session_state["vpn_running"]    = True
+            st.session_state["vpn_start_time"] = datetime.now()
             st.rerun()
-    with col_down:
-        if st.button("⏹️ VPN 중지", use_container_width=True):
-            with st.spinner(f"wg-quick down {iface} ..."):
+
+    with col_stop:
+        stop_disabled = not is_running
+        if st.button("■ VPN 중지", use_container_width=True,
+                     disabled=stop_disabled):
+            with st.spinner(f"WireGuard {iface} 중지 중..."):
                 out = wg_down(iface)
             if out:
                 st.code(out, language="text")
+            # 타이머 초기화
+            st.session_state["vpn_running"]    = False
+            st.session_state["vpn_start_time"] = None
             st.rerun()
 
-    # ── 서버 설정 자동 생성 ───────────────────────────────
+    # ── 실행 중일 때 자동 1초 새로고침 (업타임 갱신) ───────
+    if is_running:
+        time.sleep(1)
+        st.rerun()
+
+    # ── 고급 패널 (기본 접힘) ─────────────────────────────
     st.divider()
-    st.subheader("⚙️ VPN 서버 초기 설정 생성")
+    with st.expander("🔧 서버 설정 / 접속 현황 / 클라이언트 추가", expanded=False):
 
-    if IS_WINDOWS:
-        conf_exists = os.path.isfile(
-            os.path.join(_WG_WIN_CONF_DIR, f"{iface}.conf")
-        )
-    else:
-        conf_exists = os.path.isfile(f"/etc/wireguard/{iface}.conf")
+        # ── 서버 설정 생성 ────────────────────────────────
+        st.subheader("⚙️ VPN 서버 초기 설정 생성")
 
-    if conf_exists:
-        st.success(f"✅ `{iface}.conf` 이미 존재합니다. 아래에서 덮어쓸 수 있습니다.")
-
-    with st.form("server_conf_form"):
-        sv_addr    = st.text_input("서버 VPN 주소 (CIDR):", value="10.0.0.1/24")
-        sv_port    = st.number_input("수신 포트:", value=51820,
-                                     min_value=1024, max_value=65535)
-        sv_confirm = st.checkbox(
-            "기존 설정 파일을 덮어씁니다." if conf_exists else "새 설정 파일을 생성합니다."
-        )
-        sv_btn = st.form_submit_button(
-            "🔧 서버 키 생성 및 wg0.conf 작성",
-            use_container_width=True, type="primary",
-        )
-
-    if sv_btn:
-        if not sv_confirm:
-            st.warning("체크박스를 선택해야 실행됩니다.")
+        if IS_WINDOWS:
+            conf_exists = os.path.isfile(os.path.join(_WG_WIN_CONF_DIR, f"{iface}.conf"))
         else:
-            with st.spinner("키 생성 및 설정 파일 작성 중..."):
-                result = create_server_config(
-                    interface=iface,
-                    server_address=sv_addr,
-                    listen_port=int(sv_port),
-                )
+            conf_exists = os.path.isfile(f"/etc/wireguard/{iface}.conf")
 
-            if result.get("error"):
-                st.error(f"오류: {result['error']}")
+        if conf_exists:
+            st.success(f"✅ `{iface}.conf` 이미 존재합니다. 아래에서 덮어쓸 수 있습니다.")
+
+        with st.form("server_conf_form"):
+            sv_addr_f = st.text_input("서버 VPN 주소 (CIDR):", value="10.0.0.1/24")
+            sv_port_f = st.number_input("수신 포트:", value=51820,
+                                        min_value=1024, max_value=65535)
+            sv_confirm = st.checkbox(
+                "기존 설정 파일을 덮어씁니다." if conf_exists else "새 설정 파일을 생성합니다."
+            )
+            sv_btn = st.form_submit_button(
+                "🔧 서버 키 생성 및 wg0.conf 작성",
+                use_container_width=True, type="primary",
+            )
+
+        if sv_btn:
+            if not sv_confirm:
+                st.warning("체크박스를 선택해야 실행됩니다.")
             else:
-                st.session_state["server_pub"]  = result["pub"]
-                st.session_state["server_conf"] = result["conf_text"]
-                st.session_state["server_port"] = int(sv_port)
-
-                st.success(f"✅ 서버 설정 생성 완료 → `{result['conf_path']}`")
-                st.info(
-                    f"**서버 Public Key** (클라이언트 [Peer] PublicKey 에 사용):\n\n"
-                    f"```\n{result['pub']}\n```"
-                )
-                with st.expander("생성된 wg0.conf 내용 (개인키 포함 — 주의)", expanded=False):
-                    st.code(result["conf_text"], language="ini")
-
-                if IS_WINDOWS:
-                    st.info(
-                        "**다음 단계:** 아래 'VPN 시작' 버튼을 누르면\n\n"
-                        f"`wireguard.exe /installtunnelservice {result['conf_path']}`\n\n"
-                        "명령이 실행됩니다."
+                with st.spinner("키 생성 및 설정 파일 작성 중..."):
+                    result = create_server_config(
+                        interface=iface,
+                        server_address=sv_addr_f,
+                        listen_port=int(sv_port_f),
                     )
+                if result.get("error"):
+                    st.error(f"오류: {result['error']}")
+                else:
+                    st.session_state["server_pub"]  = result["pub"]
+                    st.session_state["server_port"] = int(sv_port_f)
+                    st.success(f"✅ 설정 생성 완료 → `{result['conf_path']}`")
+                    st.info(f"**서버 Public Key:**\n```\n{result['pub']}\n```")
+                    with st.expander("wg0.conf 내용 (개인키 포함)", expanded=False):
+                        st.code(result["conf_text"], language="ini")
 
-    # ── 접속 현황 ──────────────────────────────────────────
-    st.divider()
-    st.subheader("📊 피어 접속 현황 및 트래픽")
-    if st.button("🔄 현황 새로고침", use_container_width=True):
-        with st.spinner("wg show 실행 중..."):
-            peers_out = wg_show_peers()
-        if peers_out:
+        # ── 접속 현황 ─────────────────────────────────────
+        st.divider()
+        st.subheader("📊 피어 접속 현황")
+        if st.button("🔄 현황 새로고침", use_container_width=True, key="btn_peers"):
+            with st.spinner("wg show ..."):
+                peers_out = wg_show_peers()
             st.code(peers_out, language="text")
-
-            # 간단한 피어 파싱 — peer 블록 단위 카드 표시
             peer_blocks = peers_out.split("peer:")
             if len(peer_blocks) > 1:
-                st.subheader(f"탐지된 피어: {len(peer_blocks)-1}개")
                 for block in peer_blocks[1:]:
                     lines_b = block.strip().splitlines()
                     pubkey_short = lines_b[0].strip()[:20] + "…" if lines_b else "?"
-                    info = "\n".join(lines_b[:6])
                     st.markdown(
-                        f'<div class="info-card">'
-                        f'<b>Peer:</b> <code>{pubkey_short}</code><br>'
-                        f'<pre style="margin:4px 0;font-size:12px">{info}</pre>'
-                        f'</div>',
+                        f'<div class="info-card"><b>Peer:</b> <code>{pubkey_short}</code><br>'
+                        f'<pre style="font-size:12px">{"　".join(lines_b[:5])}</pre></div>',
                         unsafe_allow_html=True,
                     )
 
-    # ── 클라이언트 추가 ────────────────────────────────────
-    st.divider()
-    st.subheader("➕ 새 클라이언트 설정 생성")
-    st.warning(
-        "⚠️ 생성된 설정에는 **개인키(Private Key)** 가 포함됩니다. "
-        "QR 코드를 화면 캡처하거나 제3자에게 공유하지 마십시오."
-    )
-
-    # 서버 설정 생성 후 자동 채우기
-    _srv_pub_default  = st.session_state.get("server_pub", "")
-    _srv_port_default = st.session_state.get("server_port", 51820)
-
-    with st.form("new_client_form"):
-        c_name     = st.text_input("클라이언트 이름:", placeholder="예: my-phone")
-        c_addr     = st.text_input("클라이언트 IP:", value="10.0.0.2",
-                                   help="서버 VPN 서브넷 내 미사용 IP")
-        c_server_pub = st.text_input(
-            "서버 Public Key:",
-            value=_srv_pub_default,
-            placeholder="서버의 wg pubkey 값 — 위 '서버 설정 생성' 후 자동 입력됨",
-        )
-        c_endpoint = st.text_input(
-            "서버 Endpoint:",
-            placeholder=f"예: 203.0.113.1:{_srv_port_default}",
-        )
-        c_dns      = st.text_input("DNS:", value="1.1.1.1")
-        c_allowed  = st.text_input("AllowedIPs:", value="0.0.0.0/0")
-
-        gen_btn = st.form_submit_button("🔑 키 생성 및 설정 파일 만들기",
-                                        use_container_width=True, type="primary")
-
-    if gen_btn:
-        if not c_server_pub or not c_endpoint:
-            st.error("서버 Public Key 와 Endpoint 는 필수입니다.")
-        else:
-            with st.spinner("키 생성 중..."):
-                priv, pub = generate_keypair()
-
-            if not priv:
-                st.error(
-                    "키 생성 실패 — `wg` 명령을 찾을 수 없습니다. "
-                    "WireGuard 가 PATH 에 있는지 확인하십시오."
-                )
-            else:
-                conf_text = make_client_conf(
-                    client_privkey=priv,
-                    server_pubkey=c_server_pub,
-                    server_endpoint=c_endpoint,
-                    client_address=c_addr,
-                    dns=c_dns,
-                    allowed_ips=c_allowed,
-                )
-                # session state 에 저장 (디스크 기록 없음)
-                st.session_state["last_conf"]     = conf_text
-                st.session_state["last_conf_name"] = c_name or "client"
-                st.session_state["last_pub"]      = pub
-
-                st.success(f"✅ '{c_name}' 설정 생성 완료")
-                st.info(
-                    f"**클라이언트 Public Key** (서버 wg0.conf 의 [Peer] 에 추가):\n\n"
-                    f"```\n{pub}\n```"
-                )
-
-    # 생성된 설정 표시
-    if "last_conf" in st.session_state:
-        conf = st.session_state["last_conf"]
-        name = st.session_state.get("last_conf_name", "client")
-
+        # ── 클라이언트 추가 ───────────────────────────────
         st.divider()
-        st.subheader(f"📄 '{name}' 설정 파일")
+        st.subheader("➕ 클라이언트 설정 생성 + QR")
+        st.warning("⚠️ 개인키 포함 — QR 코드 캡처 금지")
 
-        with st.expander("설정 파일 내용 보기 (개인키 포함 — 주의)", expanded=False):
-            st.code(conf, language="ini")
+        _srv_pub_def  = st.session_state.get("server_pub", "")
+        _srv_port_def = st.session_state.get("server_port", 51820)
 
-        # 다운로드 버튼
-        st.download_button(
-            label="💾 .conf 파일 다운로드",
-            data=conf,
-            file_name=f"{name}.conf",
-            mime="text/plain",
-            use_container_width=True,
-        )
+        with st.form("new_client_form"):
+            c_name       = st.text_input("클라이언트 이름:", placeholder="my-phone")
+            c_addr       = st.text_input("클라이언트 IP:", value="10.0.0.2")
+            c_server_pub = st.text_input("서버 Public Key:", value=_srv_pub_def)
+            c_endpoint   = st.text_input("서버 Endpoint:",
+                                         placeholder=f"x.x.x.x:{_srv_port_def}")
+            c_dns        = st.text_input("DNS:", value="1.1.1.1")
+            c_allowed    = st.text_input("AllowedIPs:", value="0.0.0.0/0")
+            gen_btn = st.form_submit_button("🔑 생성", use_container_width=True,
+                                            type="primary")
 
-        # QR 코드
-        st.subheader("📱 스마트폰 QR 코드 스캔")
-        if not _QR_AVAILABLE:
-            st.warning("`pip install qrcode[pil]` 설치 후 재시작하면 QR 코드가 표시됩니다.")
-        else:
-            png = conf_to_qr_png(conf)
-            if png:
-                st.warning("⚠️ 이 QR 코드는 개인키를 포함합니다. 촬영 후 즉시 화면을 닫으십시오.")
-                st.image(png, caption=f"{name} — WireGuard QR", width=280)
+        if gen_btn:
+            if not c_server_pub or not c_endpoint:
+                st.error("서버 Public Key 와 Endpoint 는 필수입니다.")
             else:
-                st.error("QR 코드 생성에 실패했습니다.")
+                with st.spinner("키 생성 중..."):
+                    priv, pub = generate_keypair()
+                if not priv:
+                    st.error("키 생성 실패 — wg 명령을 찾을 수 없습니다.")
+                else:
+                    conf_text = make_client_conf(priv, c_server_pub, c_endpoint,
+                                                 c_addr, c_dns, c_allowed)
+                    st.session_state["last_conf"]      = conf_text
+                    st.session_state["last_conf_name"] = c_name or "client"
+                    st.session_state["last_pub"]       = pub
+                    st.success(f"✅ '{c_name}' 생성 완료")
+                    st.info(f"**클라이언트 Public Key:**\n```\n{pub}\n```")
+
+        if "last_conf" in st.session_state:
+            conf = st.session_state["last_conf"]
+            name = st.session_state.get("last_conf_name", "client")
+            st.divider()
+            st.subheader(f"📄 {name}.conf")
+            with st.expander("설정 내용 (개인키 포함)", expanded=False):
+                st.code(conf, language="ini")
+            st.download_button("💾 .conf 다운로드", data=conf,
+                               file_name=f"{name}.conf", mime="text/plain",
+                               use_container_width=True)
+            st.subheader("📱 QR 코드")
+            if not _QR_AVAILABLE:
+                st.warning("`pip install qrcode[pil]` 후 재시작하세요.")
+            else:
+                png = conf_to_qr_png(conf)
+                if png:
+                    st.warning("⚠️ 개인키 포함 — 촬영 후 즉시 화면을 닫으십시오.")
+                    st.image(png, caption=f"{name} — WireGuard QR", width=280)
+                else:
+                    st.error("QR 생성 실패")
