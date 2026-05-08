@@ -29,3 +29,25 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Home directory files (do not commit)
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.ssh/
+.gnupg/
+.gitconfig
+.wget-hsts
+.sudo_as_admin_successful
+.config/
+.cache/
+.local/
+.nvm/
+.npm/
+.pi/
+.vscode-server/
+.claude/
+.claude.json
+snap/
+ctf/
